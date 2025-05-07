@@ -1,0 +1,137 @@
+# scripts/machine_monitor_flow.jsonファイルを作成
+cat > scripts/machine_monitor_flow.json << 'EOF'
+[
+    {
+        "id": "mqtt-in",
+        "type": "mqtt in",
+        "name": "Machine Status",
+        "topic": "machine/status",
+        "qos": "2",
+        "datatype": "auto",
+        "wires": [["process-data"]]
+    },
+    {
+        "id": "process-data",
+        "type": "function",
+        "name": "Process Machine Data",
+        "func": "const parts = msg.payload.split(',');\nconst machineId = parts[0];\nconst stateId = parseInt(parts[1]);\nconst majorSetupCount = parseInt(parts[2]);\nconst isMinorSetup = parseInt(parts[3]) === 1;\n\n// ステータス更新\nmsg.topic = 'UPDATE';\nmsg.payload = {\n    machineId: machineId,\n    stateId: stateId,\n    majorSetupCount: majorSetupCount,\n    isMinorSetup: isMinorSetup,\n    timestamp: new Date()\n};\n\nreturn msg;",
+        "wires": [["update-status", "check-history"]]
+    },
+    {
+        "id": "update-status",
+        "type": "mysql",
+        "name": "Update Current Status",
+        "host": "localhost",
+        "port": "3306",
+        "db": "machine_monitor",
+        "tz": "",
+        "charset": "UTF8",
+        "sql": "INSERT INTO operation_status (machine_id, state_id, major_setup_count, is_minor_setup, timestamp) VALUES ((SELECT machine_id FROM machines WHERE machine_name = ?), ?, ?, ?, ?) ON DUPLICATE KEY UPDATE state_id = VALUES(state_id), major_setup_count = VALUES(major_setup_count), is_minor_setup = VALUES(is_minor_setup), timestamp = VALUES(timestamp)",
+        "params": ["msg.payload.machineId", "msg.payload.stateId", "msg.payload.majorSetupCount", "msg.payload.isMinorSetup", "msg.payload.timestamp"],
+        "wires": [[]]
+    },
+    {
+        "id": "check-history",
+        "type": "function",
+        "name": "Check State Change",
+        "func": "const machineId = msg.payload.machineId;\nconst stateId = msg.payload.stateId;\n\n// 履歴用のコンテキストストア\nconst history = flow.get('machineHistory') || {};\n\nif (!history[machineId] || history[machineId].stateId !== stateId) {\n    // 状態が変わった - 前の状態を終了し、新しい状態を開始\n    const now = new Date();\n    \n    if (history[machineId]) {\n        // 前の状態を終了\n        const prevHistory = history[machineId];\n        const duration = Math.floor((now - new Date(prevHistory.startTime)) / 1000);\n        \n        msg.topic = 'END_STATE';\n        msg.payload = {\n            machineId: machineId,\n            stateId: prevHistory.stateId,\n            majorSetupCount: prevHistory.majorSetupCount,\n            isMinorSetup: prevHistory.isMinorSetup,\n            startTime: prevHistory.startTime,\n            endTime: now,\n            duration: duration\n        };\n        \n        return [msg, null];\n    } else {\n        // 初回の状態\n        history[machineId] = {\n            stateId: stateId,\n            majorSetupCount: msg.payload.majorSetupCount,\n            isMinorSetup: msg.payload.isMinorSetup,\n            startTime: now\n        };\n        flow.set('machineHistory', history);\n        \n        msg.topic = 'START_STATE';\n        msg.payload = {\n            machineId: machineId,\n            stateId: stateId,\n            majorSetupCount: msg.payload.majorSetupCount,\n            isMinorSetup: msg.payload.isMinorSetup,\n            startTime: now\n        };\n        \n        return [null, msg];\n    }\n} else {\n    // 状態に変化なし\n    return [null, null];\n}\n",
+        "wires": [["end-history"], ["start-history"]]
+    },
+    {
+        "id": "end-history",
+        "type": "mysql",
+        "name": "End State History",
+        "host": "localhost",
+        "port": "3306",
+        "db": "machine_monitor",
+        "tz": "",
+        "charset": "UTF8",
+        "sql": "UPDATE operation_history SET end_time = ?, duration = ? WHERE machine_id = (SELECT machine_id FROM machines WHERE machine_name = ?) AND state_id = ? AND end_time IS NULL",
+        "params": ["msg.payload.endTime", "msg.payload.duration", "msg.payload.machineId", "msg.payload.stateId"],
+        "wires": [[]]
+    },
+    {
+        "id": "start-history",
+        "type": "mysql",
+        "name": "Start State History",
+        "host": "localhost",
+        "port": "3306",
+        "db": "machine_monitor",
+        "tz": "",
+        "charset": "UTF8",
+        "sql": "INSERT INTO operation_history (machine_id, state_id, major_setup_count, is_minor_setup, start_time) VALUES ((SELECT machine_id FROM machines WHERE machine_name = ?), ?, ?, ?, ?)",
+        "params": ["msg.payload.machineId", "msg.payload.stateId", "msg.payload.majorSetupCount", "msg.payload.isMinorSetup", "msg.payload.startTime"],
+        "wires": [[]]
+    },
+    {
+        "id": "api-current-status",
+        "type": "http in",
+        "name": "API - Current Status",
+        "url": "/api/status",
+        "method": "get",
+        "wires": [["get-current-status"]]
+    },
+    {
+        "id": "get-current-status",
+        "type": "mysql",
+        "name": "Get Current Status",
+        "host": "localhost",
+        "port": "3306",
+        "db": "machine_monitor",
+        "tz": "",
+        "charset": "UTF8",
+        "sql": "SELECT m.machine_id, m.machine_name, s.state_name, os.major_setup_count, os.is_minor_setup, os.timestamp FROM machines m JOIN operation_status os ON m.machine_id = os.machine_id JOIN states s ON os.state_id = s.state_id ORDER BY m.machine_id",
+        "wires": [["format-status-response"]]
+    },
+    {
+        "id": "format-status-response",
+        "type": "function",
+        "name": "Format Response",
+        "func": "msg.payload = {\n    timestamp: new Date(),\n    machines: msg.payload\n};\nreturn msg;",
+        "wires": [["api-status-response"]]
+    },
+    {
+        "id": "api-status-response",
+        "type": "http response",
+        "name": "",
+        "statusCode": "200",
+        "headers": {"content-type":"application/json"},
+        "wires": [[]]
+    },
+    {
+        "id": "api-history",
+        "type": "http in",
+        "name": "API - History",
+        "url": "/api/history",
+        "method": "get",
+        "wires": [["get-history"]]
+    },
+    {
+        "id": "get-history",
+        "type": "mysql",
+        "name": "Get History",
+        "host": "localhost",
+        "port": "3306",
+        "db": "machine_monitor",
+        "tz": "",
+        "charset": "UTF8",
+        "sql": "SELECT m.machine_name, s.state_name, SUM(oh.duration) as total_duration, oh.major_setup_count FROM machines m JOIN operation_history oh ON m.machine_id = oh.machine_id JOIN states s ON oh.state_id = s.state_id WHERE oh.end_time IS NOT NULL GROUP BY m.machine_id, s.state_id, oh.major_setup_count ORDER BY m.machine_id, oh.major_setup_count",
+        "wires": [["format-history-response"]]
+    },
+    {
+        "id": "format-history-response",
+        "type": "function",
+        "name": "Format History Response",
+        "func": "// マシンごとにデータをグループ化\nconst machines = {};\n\nmsg.payload.forEach(record => {\n    const machineName = record.machine_name;\n    \n    if (!machines[machineName]) {\n        machines[machineName] = {\n            name: machineName,\n            states: {},\n            setupTimes: {}\n        };\n    }\n    \n    // 状態ごとの集計\n    const stateName = record.state_name;\n    if (!machines[machineName].states[stateName]) {\n        machines[machineName].states[stateName] = 0;\n    }\n    machines[machineName].states[stateName] += record.total_duration;\n    \n    // 段取りごとの集計\n    const setupCount = record.major_setup_count;\n    if (!machines[machineName].setupTimes[setupCount]) {\n        machines[machineName].setupTimes[setupCount] = {};\n    }\n    if (!machines[machineName].setupTimes[setupCount][stateName]) {\n        machines[machineName].setupTimes[setupCount][stateName] = 0;\n    }\n    machines[machineName].setupTimes[setupCount][stateName] += record.total_duration;\n});\n\n// 配列形式に変換\nmsg.payload = {\n    timestamp: new Date(),\n    machines: Object.values(machines)\n};\n\nreturn msg;",
+        "wires": [["api-history-response"]]
+    },
+    {
+        "id": "api-history-response",
+        "type": "http response",
+        "name": "",
+        "statusCode": "200",
+        "headers": {"content-type":"application/json"},
+        "wires": [[]]
+    }
+]
+EOF
